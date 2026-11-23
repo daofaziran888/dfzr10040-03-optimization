@@ -57,6 +57,7 @@ npm run dev
 | 冲突仲裁 | `merge_conflict` | 冲突规则 | 规则编号、目标宽表、冲突字段 |
 | 质量门禁 | `quality_gate` | 门禁规则 | 规则编号、目标宽表、检查类型 |
 | 分区快照 | `snapshot_mgr` | 快照分区 | 分区编号、目标宽表、分区键值 |
+| 分区放行 | `partition_gate` | 分区放行 | 放行编号、融合批次、分区编号、确认结果、关联凭据 |
 | 数据回填 | `backfill_task` | 回填任务 | 任务编号、目标宽表、回填区间 |
 | 数据血缘 | `lineage_edge` | 血缘边 | 边编号、上游节点、下游节点 |
 | 重放队列 | `replay_queue` | 重放记录 | 记录编号、融合作业、失败原因 |
@@ -80,6 +81,25 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 质量门禁分区放行与跨日补货凭据
+
+门禁规则按级别逐分区校验，核心状态机在 `backend/app/partition_gate.py`：
+
+- **规则级别**：阻断级（`block`/`阻断` 等）触发才置「待核」；告警级（如行数低于阈值）
+  只记录不阻断，告警随实际检查覆盖的分区版本（`partition_version`）走。
+- **版本化结果**：同一 `(分区, 版本)` 重跑覆盖旧结果，检查行数不重复累计。
+- **发布保护**：待核分区拒绝用本次数据替换已发布内容；放行分区发布后保留版本号。
+- **取数凭据**：每个夜班补货请求只确认一次凭据（`/api/partition-gate/credentials`）；
+  批次含待核分区时不发本期凭据，回退上个已确认窗口合计，并可回查等待原因
+  （`/api/partition-gate/wait-reasons/{request_id}`），随后按凭据日期和金额下单。
+- **签出核对**：`/api/partition-gate/checkouts/{batch_code}` 核对实际签出日期，
+  待核分区即使被签出也取消本期资格，不能冒充本期新数据。
+- **可读明细**：`/api/partition-gate/releases/{batch_code}` 逐分区注明确认结果、
+  阻断/告警规则与关联凭据编号。
+
+场景测试见 `backend/tests/test_partition_gate.py`，路由层手工冒烟脚本见
+`backend/scripts/smoke_partition_gate.py`。
 
 领域：数据工程
 子方向：数仓与数据湖

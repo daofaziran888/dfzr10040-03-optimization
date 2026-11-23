@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -184,6 +184,28 @@ class QualityGateRule:
     block_level: str
     checked_rows: int = 0
     last_triggered: str = ""
+    # 规则级检查历史：key 为 (分区编号, 分区版本)，重跑同版本覆盖不累计。
+    partition_results: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+
+    def record_partition_result(self, partition: str, partition_version: str,
+                                finding: dict[str, Any] | None,
+                                checked_rows: int) -> dict[str, Any]:
+        """记录规则在具体分区版本上的检查结果，重跑同版本直接覆盖。"""
+        result = {
+            "rule_code": self.rule_code,
+            "block_level": self.block_level,
+            "partition": partition,
+            "partition_version": partition_version,
+            "checked_rows": checked_rows,
+            "triggered": finding is not None,
+            "finding": finding,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.partition_results[(partition, partition_version)] = result
+        self.checked_rows = checked_rows
+        if finding is not None:
+            self.last_triggered = result["checked_at"]
+        return result
 
 
 @dataclass
@@ -198,6 +220,24 @@ class SnapshotPartition:
     status_mark: str
     dependency_partitions: list[str]
     created_time: str
+    # 分区版本与放行结论：可读明细须注明确认结果并与取数凭据关联。
+    partition_version: str = "v1"
+    release_decision: str = ""
+    release_code: str = ""
+    credential_code: str = ""
+    warnings: list[dict[str, Any]] = field(default_factory=list)
+    blockers: list[dict[str, Any]] = field(default_factory=list)
+
+    def attach_release(self, decision: str, release_code: str,
+                       credential_code: str,
+                       warnings: list[dict[str, Any]] | None = None,
+                       blockers: list[dict[str, Any]] | None = None) -> None:
+        """把分区放行结果挂到快照上，随实际检查覆盖的分区版本走。"""
+        self.release_decision = decision
+        self.release_code = release_code
+        self.credential_code = credential_code
+        self.warnings = list(warnings or [])
+        self.blockers = list(blockers or [])
 
     def to_record(self) -> dict[str, Any]:
         return {

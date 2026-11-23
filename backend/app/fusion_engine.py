@@ -29,6 +29,13 @@ from app.models import (
     WatermarkRecord,
     WideTableDef,
 )
+from app.partition_gate import (
+    DECISION_PENDING,
+    DECISION_RELEASED,
+    PartitionCheckResult,
+    PartitionGateManager,
+    is_block_level,
+)
 
 
 def _now_iso() -> str:
@@ -60,6 +67,8 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        # 分区放行、发布保护、取数凭据与签出核对状态机。
+        self.partition_gate = PartitionGateManager()
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -161,7 +170,8 @@ class FusionEngine:
 
     def create_snapshot(self, target_wide_table: str, partition_key_value: str,
                         dependency_partitions: list[str] | None = None,
-                        schema_digest: str = "") -> SnapshotPartition:
+                        schema_digest: str = "",
+                        partition_version: str = "v1") -> SnapshotPartition:
         sid = self._next_seq()
         snap = SnapshotPartition(
             partition_id=sid,
@@ -173,6 +183,7 @@ class FusionEngine:
             status_mark="创建中",
             dependency_partitions=dependency_partitions or [],
             created_time=_now_iso(),
+            partition_version=partition_version,
         )
         self._snapshots[sid] = snap
         return snap
@@ -419,6 +430,7 @@ class FusionEngine:
         )
         result["quality_gate"] = quality_result
 
+        # 仅当不存在阻断级违规时才落快照；告警级违规不阻断产出。
         if quality_result.get("passed", True):
             snap = self.create_snapshot(
                 job.target_wide_table,
@@ -426,6 +438,9 @@ class FusionEngine:
             )
             snap.record_count = len(conflict_result.get("resolved", mapped_records))
             result["snapshot"] = {"partition_code": snap.partition_code, "record_count": snap.record_count}
+        else:
+            result["snapshot"] = None
+            result["blocked_reason"] = "存在阻断级质量问题，本次数据不得发布"
 
         return result
 
@@ -824,31 +839,163 @@ class FusionEngine:
 
     def _apply_quality_gates(self, records: list[dict[str, Any]],
                              target_wide_table: str) -> dict[str, Any]:
-        """应用质量门禁检查。"""
+        """应用质量门禁检查（整表口径，保持向后兼容）。
+
+        按规则级别区分阻断与告警：告警只记录不阻断，passed 仅由阻断级触发决定。
+        checked_rows 按本次实际检查行数写入，重跑不累计。
+        """
         gates = [
             g for g in self._quality_gates.values()
             if g.target_wide_table == target_wide_table
         ]
         if not gates:
-            return {"passed": True, "gates_checked": 0, "violations": []}
+            return {"passed": True, "gates_checked": 0, "violations": [],
+                    "warnings": [], "blockers": []}
 
         violations: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        blockers: list[dict[str, Any]] = []
         for gate in gates:
             gate.checked_rows = len(records)
-            if gate.check_type == "row_count_min" and len(records) < int(gate.threshold_condition):
-                violations.append({"rule_code": gate.rule_code, "check": "row_count_min",
-                                   "actual": len(records), "threshold": gate.threshold_condition})
-            elif gate.check_type == "null_check":
-                null_count = sum(
-                    1 for rec in records
-                    if rec.get(gate.threshold_condition) is None
-                )
-                if null_count > 0:
-                    violations.append({"rule_code": gate.rule_code, "check": "null_check",
-                                       "null_count": null_count})
+            finding = self.partition_gate.evaluate_rule(
+                gate, records, partition="__whole_table__", partition_version="v1",
+            )
+            if finding is None:
+                continue
+            payload = finding.to_dict()
+            violations.append(payload)
+            if is_block_level(gate.block_level):
+                blockers.append(payload)
+            else:
+                warnings.append(payload)
 
-        passed = len(violations) == 0
-        return {"passed": passed, "gates_checked": len(gates), "violations": violations}
+        # 只有阻断级规则触发才算不通过；告警不再被误作阻断。
+        passed = len(blockers) == 0
+        return {
+            "passed": passed,
+            "gates_checked": len(gates),
+            "violations": violations,
+            "warnings": warnings,
+            "blockers": blockers,
+        }
+
+    def _apply_partition_quality_gates(
+        self,
+        partitions: dict[str, list[dict[str, Any]]],
+        target_wide_table: str,
+        batch_code: str,
+        partition_versions: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """按分区逐个跑质量门禁并记录分区放行结果。
+
+        - 告警级规则触发：分区仍可放行，告警随实际检查覆盖的分区版本记录；
+        - 阻断级规则触发：分区待核，不能替换已发布内容；
+        - 同一 (分区, 版本) 重跑覆盖规则结果，不重复累计。
+        """
+        gates = [
+            g for g in self._quality_gates.values()
+            if g.target_wide_table == target_wide_table
+        ]
+        versions = partition_versions or {}
+        partition_results: dict[str, PartitionCheckResult] = {}
+        block_hit = False
+
+        for partition, rows in partitions.items():
+            version = versions.get(partition, "v1")
+            findings = []
+            for gate in gates:
+                finding = self.partition_gate.evaluate_rule(gate, rows, partition, version)
+                gate.record_partition_result(
+                    partition, version,
+                    finding.to_dict() if finding else None,
+                    checked_rows=len(rows),
+                )
+                if finding is not None:
+                    findings.append(finding)
+            decision = (
+                DECISION_PENDING
+                if any(f.level == "阻断" for f in findings)
+                else DECISION_RELEASED
+            )
+            if decision == DECISION_PENDING:
+                block_hit = True
+            partition_results[partition] = PartitionCheckResult(
+                partition=partition,
+                partition_version=version,
+                batch_code=batch_code,
+                checked_rows=len(rows),
+                decision=decision,
+                findings=findings,
+            )
+
+        release = self.partition_gate.record_batch_check(
+            batch_code=batch_code,
+            target_wide_table=target_wide_table,
+            partition_results=partition_results,
+        )
+        return {
+            "passed": not block_hit,
+            "gates_checked": len(gates),
+            "release_code": release.release_code,
+            "partition_results": {p: r.to_dict() for p, r in partition_results.items()},
+            "released_partitions": release.released_partitions,
+            "blocked_partitions": release.blocked_partitions,
+            "release": release.to_dict(),
+        }
+
+    def run_partitioned_quality_gate(
+        self,
+        job_id: int,
+        partitions: dict[str, list[dict[str, Any]]],
+        batch_code: str,
+        partition_versions: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """对外的分区门禁入口：校验分区、登记放行结果并为放行分区产出可读快照。"""
+        job = self._fusion_jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "message": f"融合作业 {job_id} 不存在"}
+        quality = self._apply_partition_quality_gates(
+            partitions=partitions,
+            target_wide_table=job.target_wide_table,
+            batch_code=batch_code,
+            partition_versions=partition_versions,
+        )
+        release = self.partition_gate.get_release(batch_code)
+        snapshots: list[dict[str, Any]] = []
+        assert release is not None
+        for partition, result in release.partitions.items():
+            snap = self.create_snapshot(
+                target_wide_table=job.target_wide_table,
+                partition_key_value=partition,
+                partition_version=result.partition_version,
+            )
+            snap.record_count = result.checked_rows
+            snap.attach_release(
+                decision=result.decision,
+                release_code=release.release_code,
+                credential_code=release.credential_code or "",
+                warnings=[f.to_dict() for f in result.warnings],
+                blockers=[f.to_dict() for f in result.blockers],
+            )
+            # 待核分区保持创建中，只有放行分区可置为可用。
+            if result.decision == DECISION_RELEASED:
+                snap.status_mark = "可用"
+            snapshots.append({
+                "partition_code": snap.partition_code,
+                "partition": partition,
+                "partition_version": result.partition_version,
+                "record_count": snap.record_count,
+                "status_mark": snap.status_mark,
+                "release_decision": snap.release_decision,
+            })
+        return {
+            "ok": True,
+            "job_code": job.job_code,
+            "batch_code": batch_code,
+            "quality_gate": quality,
+            "snapshots": snapshots,
+            "partition_details": release.readable_partition_details(),
+        }
 
     @staticmethod
     def _make_merge_key(record: dict[str, Any], join_key: str) -> str:

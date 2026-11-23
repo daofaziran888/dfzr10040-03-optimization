@@ -9,6 +9,7 @@ from app.services.fusion_job import FusionJobService
 from app.services.merge_conflict import MergeConflictService
 from app.services.quality_gate import QualityGateService
 from app.services.snapshot_mgr import SnapshotMgrService
+from app.services.partition_gate import PartitionGateService
 from app.services.backfill_task import BackfillTaskService
 from app.services.lineage_edge import LineageEdgeService
 from app.services.replay_queue import ReplayQueueService
@@ -33,6 +34,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "merge_conflict": MergeConflictService(),
     "quality_gate": QualityGateService(),
     "snapshot_mgr": SnapshotMgrService(),
+    "partition_gate": PartitionGateService(),
     "backfill_task": BackfillTaskService(),
     "lineage_edge": LineageEdgeService(),
     "replay_queue": ReplayQueueService(),
